@@ -1,8 +1,8 @@
+from fastapi import Request, HTTPException
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 import secrets
-
 
 SECRET_KEY = secrets.token_hex(32)
 ALGORITHM = "HS256"
@@ -29,3 +29,22 @@ def decode_access_token(token: str):
         return payload
     except JWTError:
         return None
+
+class AdminAuthBackend:
+    def __init__(self):
+        self.middlewares = []
+
+    async def __call__(self, request: Request) -> bool:
+        token = request.cookies.get("access_token") or request.headers.get("Authorization")
+        if token and token.startswith("Bearer "):
+            token = token.split(" ")[1]
+        else:
+            raise HTTPException(status_code=403, detail="Admins only!")
+
+        payload = decode_access_token(token)
+        if not payload or payload.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Admins only!")
+
+        return True
+
+admin_authentication_backend = AdminAuthBackend()

@@ -1,10 +1,32 @@
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query, Request
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 import models, auth, schemas
 import json
+from sqladmin import Admin, ModelView
+from sqlalchemy import func
+from datetime import datetime
+from fastapi.responses import StreamingResponse
+from auth import admin_authentication_backend
+import io
+import csv
 
 app = FastAPI()
+
+admin = Admin(app, engine, authentication_backend=admin_authentication_backend)
+
+class UserAdmin(ModelView, model=models.User):
+    column_list = [models.User.id, models.User.username, models.User.role]
+
+class RoomAdmin(ModelView, model=models.Room):
+    column_list = [models.Room.id, models.Room.name, models.Room.description]
+
+class MessageAdmin(ModelView, model=models.Message):
+    column_list = [models.Message.id, models.Message.content, models.Message.timestamp]
+
+admin.add_view(UserAdmin)
+admin.add_view(RoomAdmin)
+admin.add_view(MessageAdmin)
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -37,10 +59,51 @@ def login(user: schemas.UserCreate, db: Session = Depends(get_db)):
     access_token = auth.create_access_token(data={"sub": db_user.username, "role": db_user.role})
     return {"access_token": access_token, "token_type": "bearer"}
 
+@app.get("/analytics/messages_per_room")
+def messages_per_room(
+    start_date: datetime | None = Query(None),
+    end_date: datetime | None = Query(None),
+    db: Session = Depends(get_db),
+    _: bool = Depends(admin_authentication_backend), 
+):
+    query = db.query(
+        models.Room.name,
+        func.count(models.Message.id).label("message_count")
+    ).join(models.Message, models.Room.id == models.Message.room_id)
+
+    if start_date:
+        query = query.filter(models.Message.timestamp >= start_date)
+    if end_date:
+        query = query.filter(models.Message.timestamp <= end_date)
+
+    query = query.group_by(models.Room.name)
+    results = query.all()
+    return [{"room": name, "message_count": count} for name, count in results]
+
+@app.get("/analytics/user_activity")
+def user_activity(
+    start_date: datetime | None = Query(None),
+    end_date: datetime | None = Query(None),
+    db: Session = Depends(get_db),
+    _: bool = Depends(admin_authentication_backend),  
+):
+    query = db.query(
+        models.User.username,
+        func.count(models.Message.id).label("message_count")
+    ).join(models.Message, models.User.id == models.Message.user_id)
+
+    if start_date:
+        query = query.filter(models.Message.timestamp >= start_date)
+    if end_date:
+        query = query.filter(models.Message.timestamp <= end_date)
+
+    query = query.group_by(models.User.username)
+    results = query.all()
+    return [{"user": username, "message_count": count} for username, count in results]
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections = {}  
+        self.active_connections = {}
 
     async def connect(self, room_id: str, websocket: WebSocket):
         await websocket.accept()
@@ -73,7 +136,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     await manager.connect(room_id, websocket)
     db = SessionLocal()
 
-    
     messages = (
         db.query(models.Message)
         .filter(models.Message.room_id == room_id)
@@ -109,4 +171,64 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
         manager.disconnect(room_id, websocket)
         db.close()
 
+@app.get("/analytics/messages_per_room/export")
+def export_messages_per_room_csv(
+    start_date: datetime | None = Query(None),
+    end_date: datetime | None = Query(None),
+    db: Session = Depends(get_db),
+    _: bool = Depends(admin_authentication_backend),
+):
+    query = db.query(
+        models.Room.name,
+        func.count(models.Message.id).label("message_count")
+    ).join(models.Message, models.Room.id == models.Message.room_id)
 
+    if start_date:
+        query = query.filter(models.Message.timestamp >= start_date)
+    if end_date:
+        query = query.filter(models.Message.timestamp <= end_date)
+
+    query = query.group_by(models.Room.name)
+    results = query.all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["room", "message_count"])
+    for name, count in results:
+        writer.writerow([name, count])
+
+    output.seek(0)
+    return StreamingResponse(output, media_type="text/csv", headers={
+        "Content-Disposition": "attachment; filename=messages_per_room.csv"
+    })
+
+@app.get("/analytics/user_activity/export")
+def export_user_activity_csv(
+    start_date: datetime | None = Query(None),
+    end_date: datetime | None = Query(None),
+    db: Session = Depends(get_db),
+    _: bool = Depends(admin_authentication_backend),
+):
+    query = db.query(
+        models.User.username,
+        func.count(models.Message.id).label("message_count")
+    ).join(models.Message, models.User.id == models.Message.user_id)
+
+    if start_date:
+        query = query.filter(models.Message.timestamp >= start_date)
+    if end_date:
+        query = query.filter(models.Message.timestamp <= end_date)
+
+    query = query.group_by(models.User.username)
+    results = query.all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["user", "message_count"])
+    for username, count in results:
+        writer.writerow([username, count])
+
+    output.seek(0)
+    return StreamingResponse(output, media_type="text/csv", headers={
+        "Content-Disposition": "attachment; filename=user_activity.csv"
+    })
